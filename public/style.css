@@ -14,3 +14,6 @@ form.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));g
 @media(max-width:720px){.shell{grid-template-columns:1fr}.side{grid-auto-flow:column;overflow-x:auto}}
 select,textarea{font:inherit;min-height:48px;border-radius:12px;border:1px solid #4a3a7a;padding:0 10px;background:#1f1438;color:#fff}h3{color:#c9b8ff}
 div.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:12px 0}
+.stat{background:var(--card);border-radius:14px;padding:12px;display:grid;gap:4px}.stat span{color:var(--lav);font-size:.85rem}.stat b{font-size:1.2rem}.stat.good b{color:#7be0a5}.stat.bad b{color:#ff8fb1}.hint{color:var(--lav);font-size:.85rem}
+@media print{.side,.noprint,#toast{display:none!important}.shell{display:block}body{background:#fff;color:#000}.main{padding:0}table,th,td{background:#fff!important;color:#000!important;border-color:#999!important}h3{color:#000}}
