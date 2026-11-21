@@ -26,8 +26,8 @@ async function audit(env, u, action, entity, id, before, after) {
   await env.DB.prepare('INSERT INTO audit_logs(user_id,action,entity,entity_id,before_json,after_json) VALUES(?,?,?,?,?,?)')
     .bind(u?.id ?? null, action, entity, String(id ?? ''), before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null).run();
 }
-const broadcast = (env, type, data) => env.HUB.get(env.HUB.idFromName('main'))
-  .fetch('https://hub/broadcast', { method: 'POST', body: JSON.stringify({ type, ...data }) });
+const broadcast = (env, type) => env.HUB.get(env.HUB.idFromName('main'))
+  .fetch('https://hub/broadcast', { method: 'POST', body: JSON.stringify({ type }) }).catch(() => {});
 const str = (v, max, name) => { if (typeof v !== 'string' || !v.trim() || v.length > max) throw new HttpErr(400, `حقل غير صالح: ${name}`); return v.trim(); };
 const money = (v, name) => { const n = Math.round(Number(v) * 100); if (!Number.isFinite(n) || n < 0) throw new HttpErr(400, `قيمة غير صالحة: ${name}`); return n; };
 
@@ -35,6 +35,42 @@ async function newSession(env, userId) {
   const t = hex(crypto.getRandomValues(new Uint8Array(32))); const exp = Date.now() + 7 * 864e5;
   await env.DB.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').bind(await sha(t), userId, exp).run();
   return `sid=${t}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${7 * 86400}`;
+}
+
+const SPEC = {
+  warehouses: [['name', 'name', 's', 80, 'الاسم'], ['location', 'location', 'o', 200, 'الموقع']],
+  materials: [['sku', 'sku', 's', 40, 'الكود'], ['name', 'name', 's', 120, 'الاسم'], ['unit', 'unit', 's', 20, 'الوحدة'],
+    ['unit_cost', 'unit_cost_piastres', 'm', 0, 'سعر الشراء'], ['min_stock', 'min_stock', 'n', 0, 'حد إعادة الطلب']]
+};
+const num = (v, label) => { const n = Number(v); if (v === '' || v == null || !Number.isFinite(n) || n < 0) throw new HttpErr(400, `قيمة غير صالحة: ${label}`); return n; };
+const conv = ([k, col, t, max, label], v) => t === 's' ? str(v, max, label) : t === 'o' ? (v == null || v === '' ? null : str(String(v), max, label)) : t === 'm' ? money(v, label) : num(v, label);
+async function crud(env, user, m, ent, id, body) {
+  const sp = SPEC[ent], need = a => { if (!can(user, `${ent}.${a}`)) throw new HttpErr(403, 'غير مصرح'); };
+  if (!id) {
+    if (m === 'GET') { need('view'); return J((await env.DB.prepare(`SELECT * FROM ${ent} WHERE status='active' ORDER BY id DESC`).all()).results); }
+    if (m === 'POST') {
+      need('create'); const vals = sp.map(s => conv(s, body[s[0]]));
+      try {
+        const r = await env.DB.prepare(`INSERT INTO ${ent}(${sp.map(s => s[1]).join(',')}) VALUES(${sp.map(() => '?').join(',')})`).bind(...vals).run();
+        await audit(env, user, 'create', ent, r.meta.last_row_id, null, body); await broadcast(env, ent); return J({ id: r.meta.last_row_id }, 201);
+      } catch (e) { throw new HttpErr(409, 'الكود أو الاسم مكرر'); }
+    }
+  } else {
+    const old = await env.DB.prepare(`SELECT * FROM ${ent} WHERE id=?`).bind(id).first();
+    if (!old) throw new HttpErr(404, 'غير موجود');
+    if (m === 'PUT') {
+      need('edit'); const f = sp.filter(s => s[0] !== 'sku'), vals = f.map(s => conv(s, body[s[0]]));
+      let r; try { r = await env.DB.prepare(`UPDATE ${ent} SET ${f.map(s => s[1] + '=?').join(',')},version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`).bind(...vals, id, +body.version).run(); }
+      catch (e) { throw new HttpErr(409, 'الاسم مكرر'); }
+      if (!r.meta.changes) throw new HttpErr(409, 'تم تعديل هذا السجل من جهاز آخر، حدّث الصفحة');
+      await audit(env, user, 'update', ent, id, old, body); await broadcast(env, ent); return J({ ok: true });
+    }
+    if (m === 'DELETE') {
+      need('delete'); await env.DB.prepare(`UPDATE ${ent} SET status='archived',version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(id).run();
+      await audit(env, user, 'archive', ent, id, old); await broadcast(env, ent); return J({ ok: true });
+    }
+  }
+  throw new HttpErr(405, 'طريقة غير مدعومة');
 }
 
 async function handle(req, env) {
@@ -108,6 +144,42 @@ async function handle(req, env) {
       await env.DB.prepare("UPDATE products SET status='archived',version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
       await audit(env, user, 'archive', 'products', id, old); await broadcast(env, 'products', { by: user.id }); return J({ ok: true });
     }
+  }
+  const gm = p.match(/^\/api\/(warehouses|materials)(?:\/(\d+))?$/);
+  if (gm) return crud(env, user, m, gm[1], gm[2] ? +gm[2] : 0, body);
+  if (p === '/api/stock' && m === 'GET') {
+    if (!can(user, 'stock.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT m.id material_id,m.sku,m.name,m.unit,m.min_stock,w.id warehouse_id,w.name warehouse,COALESCE(SUM(i.qty),0) qty
+      FROM materials m CROSS JOIN warehouses w LEFT JOIN inventory_movements i ON i.material_id=m.id AND i.warehouse_id=w.id
+      WHERE m.status='active' AND w.status='active' GROUP BY m.id,w.id ORDER BY m.name,w.name`).all()).results);
+  }
+  if (p === '/api/stock/ledger' && m === 'GET') {
+    if (!can(user, 'stock.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT i.id,i.qty,i.kind,i.note,i.created_at,m.name material,w.name warehouse,u.name user
+      FROM inventory_movements i JOIN materials m ON m.id=i.material_id JOIN warehouses w ON w.id=i.warehouse_id
+      LEFT JOIN users u ON u.id=i.user_id ORDER BY i.id DESC LIMIT 50`).all()).results);
+  }
+  if (p === '/api/stock/move' && m === 'POST') {
+    if (!can(user, 'stock.move')) throw new HttpErr(403, 'غير مصرح');
+    const kind = body.kind, sign = { opening: 1, in: 1, out: -1, damaged: -1, adjust: 0 }[kind];
+    if (sign === undefined) throw new HttpErr(400, 'نوع الحركة غير صالح');
+    let q = Number(body.qty); if (!Number.isFinite(q) || q === 0 || (sign && q < 0)) throw new HttpErr(400, 'الكمية غير صالحة');
+    if (sign) q *= sign;
+    const mid = +body.material_id, wid = +body.warehouse_id, rid = str(body.request_id, 64, 'المعرف');
+    const mat = await env.DB.prepare("SELECT id,name,min_stock FROM materials WHERE id=? AND status='active'").bind(mid).first();
+    const wh = await env.DB.prepare("SELECT id FROM warehouses WHERE id=? AND status='active'").bind(wid).first();
+    if (!mat || !wh) throw new HttpErr(400, 'الخامة أو المخزن غير موجود');
+    let r;
+    try {
+      r = await env.DB.prepare(`INSERT INTO inventory_movements(material_id,warehouse_id,qty,kind,note,user_id,request_id)
+        SELECT ?,?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(qty),0) FROM inventory_movements WHERE material_id=? AND warehouse_id=?)+? >= 0`)
+        .bind(mid, wid, q, kind, body.note ? String(body.note).slice(0, 200) : null, user.id, rid, mid, wid, q).run();
+    } catch (e) { if (/UNIQUE/i.test(e.message)) return J({ ok: true, duplicate: true }); throw e; }
+    if (!r.meta.changes) throw new HttpErr(409, 'الرصيد في هذا المخزن غير كافٍ');
+    await audit(env, user, 'stock.' + kind, 'inventory_movements', r.meta.last_row_id, null, { mid, wid, q });
+    const t = await env.DB.prepare('SELECT COALESCE(SUM(qty),0) q FROM inventory_movements WHERE material_id=?').bind(mid).first();
+    if (q < 0 && t.q < mat.min_stock) await env.DB.prepare('INSERT INTO notifications(kind,message) VALUES(?,?)').bind('low_stock', `انخفاض مخزون: ${mat.name}`).run();
+    await broadcast(env, 'stock'); return J({ ok: true }, 201);
   }
   throw new HttpErr(404, 'غير موجود');
 }
