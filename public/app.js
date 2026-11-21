@@ -13,9 +13,10 @@ const PAGES = {
 };
 PAGES.suppliers = { t: 'الموردون', api: '/suppliers', f: [['name', 'اسم المورد', 'name'], ['phone', 'الهاتف', 'phone', '', 'o'], ['address', 'العنوان', 'address', '', 'o']] };
 PAGES.customers = { t: 'العملاء', api: '/customers', f: [['name', 'اسم العميل', 'name'], ['phone', 'الهاتف', 'phone', '', 'o'], ['address', 'العنوان', 'address', '', 'o']] };
-const NAV = [['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون'], ['suppliers', 'الموردون'], ['purchases', 'المشتريات'], ['customers', 'العملاء'], ['sales', 'المبيعات'], ['pstock', 'مخزون المنتجات']];
+PAGES.stage_defs = { t: 'مراحل التصنيع (الترتيب بالأرقام)', api: '/stage_defs', f: [['name', 'اسم المرحلة', 'name'], ['position', 'الترتيب', 'position', 'n']] };
+const NAV = [['dashboard', 'لوحة التحكم'], ['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون'], ['suppliers', 'الموردون'], ['purchases', 'المشتريات'], ['customers', 'العملاء'], ['sales', 'المبيعات'], ['pstock', 'مخزون المنتجات'], ['bom', 'وصفات التصنيع'], ['production', 'أوامر التصنيع'], ['stage_defs', 'مراحل التصنيع'], ['finance', 'المصروفات والإيرادات'], ['reports', 'التقارير']];
 const KINDS = { opening: 'رصيد افتتاحي', in: 'دخول', out: 'صرف', damaged: 'تالف', adjust: 'تسوية (+/-)' };
-let me, ws, retry = 0, page = 'products', reload = () => {};
+let me, ws, retry = 0, page = 'dashboard', reload = () => {};
 
 function login(setup) {
   app.innerHTML = `<form class="login" id="f"><h2>تسجيل الدخول</h2>
@@ -34,7 +35,7 @@ function connect() {
 }
 function go(p) {
   page = p; document.querySelectorAll('.side [data-p]').forEach(b => b.classList.toggle('on', b.dataset.p === p));
-  ({ stock, purchases, sales, pstock }[p] || crud)(p);
+  ({ stock, purchases, sales, pstock, bom, production, dashboard, finance, reports }[p] || crud)(p);
 }
 async function crud(p) {
   const P = PAGES[p]; let rows = [];
@@ -138,6 +139,107 @@ async function pstock() {
   $('#mv').onsubmit = async e => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.request_id = crypto.randomUUID();
     try { await api('/product-stock/move', 'POST', d); e.target.qty.value = ''; e.target.note.value = ''; toast('تم تسجيل الحركة'); } catch (x) { toast(x.message, 1); } };
   reload();
+}
+async function bom() {
+  let prods = [], mats = [];
+  try { [prods, mats] = await Promise.all([api('/products'), api('/materials')]); } catch (x) { toast(x.message, 1); }
+  const line = (mid = '', q = '') => `<div class="row ln"><select name="material_id">${mats.map(o => `<option value="${o.id}" ${o.id == mid ? 'selected' : ''}>${esc(o.name)} (${esc(o.unit)})</option>`).join('')}</select><input name="qty" type="number" step="any" min="0" placeholder="الكمية للوحدة الواحدة" value="${q}" required><button type="button" class="danger rm">حذف</button></div>`;
+  $('#view').innerHTML = `<div class="bar"><h2>وصفات التصنيع</h2></div><form id="bf"><div class="row"><select name="product_id">${prods.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}</select></div>
+  <p>الخامات اللازمة لتصنيع <b>وحدة واحدة</b> من المنتج:</p><div id="lines"></div><button type="button" class="ghost" id="addl">+ إضافة خامة</button> <button>حفظ الوصفة</button></form>`;
+  const loadB = async () => { const pid = $('#bf').product_id.value; if (!pid) return; try { const r = await api('/bom?product_id=' + pid); $('#lines').innerHTML = r.length ? r.map(x => line(x.material_id, x.qty_per_unit)).join('') : line(); } catch (x) { toast(x.message, 1); } };
+  $('#bf').product_id.onchange = loadB;
+  $('#addl').onclick = () => $('#lines').insertAdjacentHTML('beforeend', line());
+  $('#lines').onclick = e => { if (e.target.classList.contains('rm') && document.querySelectorAll('.ln').length > 1) e.target.closest('.ln').remove(); };
+  $('#bf').onsubmit = async e => { e.preventDefault(); const items = [...document.querySelectorAll('.ln')].map(d => ({ material_id: d.querySelector('[name=material_id]').value, qty: d.querySelector('[name=qty]').value }));
+    try { await api('/bom', 'PUT', { product_id: e.target.product_id.value, items }); toast('تم حفظ الوصفة'); } catch (x) { toast(x.message, 1); } };
+  reload = () => {}; loadB();
+}
+const ST = { open: 'جديد', in_progress: 'قيد التنفيذ', completed: 'مكتمل', cancelled: 'ملغي' };
+async function production() {
+  let prods = [], whs = [], cur = 0, rid = crypto.randomUUID(), list = [];
+  try { [prods, whs] = await Promise.all([api('/products'), api('/warehouses')]); } catch (x) { toast(x.message, 1); }
+  const opt = a => a.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('');
+  $('#view').innerHTML = `<div class="bar"><h2>أوامر التصنيع</h2></div>
+  <form class="row" id="po"><select name="product_id" required>${opt(prods)}</select><select name="warehouse_id" required>${opt(whs)}</select><input name="qty" type="number" step="any" min="0" placeholder="الكمية المطلوبة" required><input name="due_date" type="date"><input name="note" placeholder="ملاحظة"><button>إنشاء أمر تصنيع</button></form>
+  <div style="overflow-x:auto"><table><thead><tr><th>رقم</th><th>المنتج</th><th>الكمية</th><th>المراحل</th><th>الموعد</th><th>الحالة</th><th>تكلفة الوحدة</th><th></th></tr></thead><tbody id="ol"></tbody></table></div><div id="det"></div>`;
+  const today = new Date().toISOString().slice(0, 10);
+  const draw = () => { $('#ol').innerHTML = list.map(r => { const late = r.due_date && r.due_date < today && ['open', 'in_progress'].includes(r.status);
+    return `<tr><td>MO-${r.id}</td><td>${esc(r.product)}</td><td>${r.status === 'completed' ? r.qty_good + ' (تالف ' + r.qty_scrap + ')' : r.qty_planned}</td><td>${r.done}/${r.total}</td><td>${esc(r.due_date || '')}${late ? ' ⚠️ متأخر' : ''}</td><td>${ST[r.status]}</td><td>${r.status === 'completed' && r.qty_good > 0 ? (r.total_cost_piastres / r.qty_good / 100).toFixed(2) : ''}</td><td><button class="ghost" data-o="${r.id}">تفاصيل</button></td></tr>`; }).join('') || '<tr><td colspan="8">لا توجد أوامر</td></tr>'; };
+  const det = async () => { if (!cur) return; try { const { order: o, stages, mats } = await api('/production/' + cur); const open = ['open', 'in_progress'].includes(o.status); const nextId = (stages.find(s => s.status === 'pending') || {}).id;
+    $('#det').innerHTML = `<div class="card"><h3>MO-${o.id}: ${esc(o.product)} — ${ST[o.status]}</h3>
+    <b>المراحل</b><ul>${stages.map(s => `<li>${s.status === 'done' ? '✅' : '⬜'} ${esc(s.name)} ${open && s.id === nextId ? `<button class="ghost" data-s="${s.id}">تم</button>` : ''}</li>`).join('') || '<li>لا توجد مراحل</li>'}</ul>
+    <b>الخامات المطلوبة للكمية المخططة (${o.qty_planned})</b><div style="overflow-x:auto"><table><thead><tr><th>الخامة</th><th>المطلوب</th><th>المتاح في ${esc(o.warehouse)}</th></tr></thead><tbody>${mats.map(m => `<tr><td>${esc(m.name)}</td><td>${+(m.qty_per_unit * o.qty_planned).toFixed(3)} ${esc(m.unit)}</td><td>${m.have >= m.qty_per_unit * o.qty_planned ? '' : '⚠️ '}${m.have}</td></tr>`).join('')}</tbody></table></div>
+    ${o.status === 'completed' ? `<p>الكمية الجيدة: ${o.qty_good} | التالف: ${o.qty_scrap}<br>تكلفة الخامات: ${o.material_cost_piastres / 100} | العمالة: ${o.labor_piastres / 100} | التشغيل: ${o.overhead_piastres / 100}<br><b>الإجمالي: ${o.total_cost_piastres / 100} ج.م</b></p>` : ''}
+    ${open ? `<form class="row" id="cf"><input name="qty_good" type="number" step="any" min="0" placeholder="الكمية الجيدة" required><input name="qty_scrap" type="number" step="any" min="0" placeholder="الكمية التالفة"><input name="labor" type="number" step="any" min="0" placeholder="تكلفة العمالة (ج.م)"><input name="overhead" type="number" step="any" min="0" placeholder="مصروفات التشغيل (ج.م)"><button>إتمام التصنيع واستلام المنتج</button></form><button class="danger" data-c="1">إلغاء الأمر</button>` : ''}</div>`; } catch (x) { toast(x.message, 1); } };
+  reload = async () => { try { list = await api('/production'); draw(); det(); } catch (x) { toast(x.message, 1); } };
+  $('#po').onsubmit = async e => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.request_id = rid;
+    try { const r = await api('/production', 'POST', d); rid = crypto.randomUUID(); e.target.qty.value = ''; e.target.note.value = ''; cur = r.id; toast('تم إنشاء الأمر'); } catch (x) { toast(x.message, 1); } };
+  $('#ol').onclick = e => { if (e.target.dataset.o) { cur = +e.target.dataset.o; det(); } };
+  $('#det').onclick = async e => { try { if (e.target.dataset.s) { await api(`/production/${cur}/stage`, 'POST', { stage_id: e.target.dataset.s }); toast('تم إنهاء المرحلة'); }
+    if (e.target.dataset.c && confirm('إلغاء أمر التصنيع؟')) { await api(`/production/${cur}/cancel`, 'POST', {}); toast('تم الإلغاء'); } } catch (x) { toast(x.message, 1); } };
+  $('#det').onsubmit = async e => { e.preventDefault(); if (!confirm('سيتم خصم الخامات وإضافة المنتج للمخزن. متأكدة؟')) return;
+    try { await api(`/production/${cur}/complete`, 'POST', Object.fromEntries(new FormData(e.target))); toast('تم إتمام التصنيع'); } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+const money2 = v => (v / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const isoD = d => d.toLocaleDateString('en-CA');
+function chart(s) {
+  const keys = [...new Set([...s.sales, ...s.purchases, ...s.expenses].map(r => r.d))].sort();
+  if (!keys.length) return '<p>لا توجد حركة مسجلة في هذه الفترة</p>';
+  const get = (a, k) => (a.find(r => r.d === k) || {}).t || 0, max = Math.max(1, ...keys.flatMap(k => [get(s.sales, k), get(s.purchases, k), get(s.expenses, k)]));
+  const W = Math.max(320, keys.length * 44), H = 200, cols = ['#8b63ff', '#c9b8ff', '#ff8fb1'];
+  const g = keys.map((k, i) => [s.sales, s.purchases, s.expenses].map((a, j) => { const h = Math.round(get(a, k) / max * (H - 30)); return `<rect x="${i * 44 + 6 + j * 12}" y="${H - 20 - h}" width="10" height="${h}" fill="${cols[j]}" rx="2"/>`; }).join('') + `<text x="${i * 44 + 22}" y="${H - 5}" font-size="9" text-anchor="middle" fill="currentColor">${esc(k.slice(-5))}</text>`).join('');
+  return `<div style="overflow-x:auto"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">${g}</svg></div><p><span style="color:#8b63ff">■</span> المبيعات &nbsp; <span style="color:#c9b8ff">■</span> المشتريات &nbsp; <span style="color:#ff8fb1">■</span> المصروفات</p>`;
+}
+async function dashboard() {
+  const now = new Date(); let from = isoD(new Date(now.getFullYear(), now.getMonth(), 1)), to = isoD(now);
+  $('#view').innerHTML = `<div class="bar"><h2>لوحة التحكم</h2></div><div class="row" id="rg"><button class="ghost" data-r="day">اليوم</button><button class="ghost" data-r="week">الأسبوع</button><button class="ghost" data-r="month">الشهر</button><button class="ghost" data-r="year">السنة</button><input type="date" id="df" value="${from}"><input type="date" id="dt" value="${to}"><button id="dg">عرض</button></div><div id="dash"></div>`;
+  $('#rg').onclick = e => { const r = e.target.dataset.r; if (r) { to = isoD(now); from = r === 'day' ? to : r === 'week' ? isoD(new Date(now - 6 * 864e5)) : r === 'month' ? isoD(new Date(now.getFullYear(), now.getMonth(), 1)) : isoD(new Date(now.getFullYear(), 0, 1)); $('#df').value = from; $('#dt').value = to; reload(); }
+    if (e.target.id === 'dg') { from = $('#df').value; to = $('#dt').value; reload(); } };
+  const card = (t, v, c = '') => `<div class="stat ${c}"><span>${t}</span><b>${v}</b></div>`;
+  reload = async () => { try { const d = await api(`/dashboard?from=${from}&to=${to}`);
+    $('#dash').innerHTML = `<p>الفترة: ${esc(d.from)} إلى ${esc(d.to)} (التواريخ بتوقيت UTC)</p><div class="stats">
+    ${card('المبيعات (' + d.sales.c + ' فاتورة)', money2(d.sales.t))}${card('المشتريات (' + d.purchases.c + ' فاتورة)', money2(d.purchases.t))}${card('المصروفات', money2(d.expenses), 'bad')}${card('إيرادات أخرى', money2(d.other_revenue))}
+    ${card('تكلفة المبيعات التقديرية', money2(d.cogs))}${card('الربح التقديري', money2(d.profit), d.profit >= 0 ? 'good' : 'bad')}${card('المحصّل من العملاء', money2(d.collected))}${card('المدفوع للموردين', money2(d.paid))}
+    ${card('قيمة مخزون الخامات', money2(d.inv_materials))}${card('قيمة مخزون المنتجات', money2(d.inv_products))}${card('مستحق على العملاء', money2(d.receivable))}${card('مستحق للموردين', money2(d.payable))}
+    ${card('أوامر تصنيع جارية', d.production.running)}${card('أوامر متأخرة', d.production.late, d.production.late ? 'bad' : '')}${card('أوامر اكتملت بالفترة', d.production.completed)}
+    ${card('منتجات / خامات', d.counts.products + ' / ' + d.counts.materials)}${card('موردون / عملاء', d.counts.suppliers + ' / ' + d.counts.customers)}</div>
+    <p class="hint">الربح التقديري = المبيعات + الإيرادات الأخرى − تكلفة المبيعات (بتكلفة المنتج المسجلة في صفحة المنتجات) − المصروفات.</p>
+    <h3>المبيعات والمشتريات والمصروفات</h3>${chart(d.series)}
+    <h3>تنبيهات نقص الخامات</h3><div style="overflow-x:auto"><table><thead><tr><th>الخامة</th><th>الرصيد</th><th>حد إعادة الطلب</th></tr></thead><tbody>${d.low.map(r => `<tr><td>${esc(r.name)}</td><td>⚠️ ${r.q} ${esc(r.unit)}</td><td>${r.min_stock}</td></tr>`).join('') || '<tr><td colspan="3">لا توجد خامات تحت الحد</td></tr>'}</tbody></table></div>
+    <h3>آخر العمليات</h3><div style="overflow-x:auto"><table><thead><tr><th>الوقت</th><th>المستخدم</th><th>العملية</th></tr></thead><tbody>${d.recent.map(r => `<tr><td>${esc(r.created_at)}</td><td>${esc(r.user)}</td><td>${esc(r.action)} ${esc(r.entity || '')} ${esc(r.entity_id || '')}</td></tr>`).join('')}</tbody></table></div>`; } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+const FCAT = { expense: ['تشغيل', 'رواتب', 'إيجار', 'كهرباء ومياه', 'صيانة', 'نقل وشحن', 'مصروفات إدارية', 'أخرى'], revenue: ['إيرادات أخرى', 'أخرى'] };
+async function finance() {
+  let rid = crypto.randomUUID();
+  const cats = k => FCAT[k].map(c => `<option>${c}</option>`).join('');
+  $('#view').innerHTML = `<div class="bar"><h2>المصروفات والإيرادات الأخرى</h2></div><form class="row" id="ff"><select name="kind"><option value="expense">مصروف</option><option value="revenue">إيراد آخر</option></select><select name="category">${cats('expense')}</select>
+  <input name="amount" type="number" step="any" min="0" placeholder="المبلغ (ج.م)" required><input name="entry_date" type="date" value="${isoD(new Date())}" required><input name="note" placeholder="ملاحظة"><button>تسجيل</button></form>
+  <p class="hint">مبيعات العملاء ومشتريات الموردين بتتسجل تلقائياً من صفحاتها، وهنا بتسجلي المصروفات والإيرادات الأخرى بس.</p>
+  <div style="overflow-x:auto"><table><thead><tr><th>التاريخ</th><th>النوع</th><th>التصنيف</th><th>المبلغ</th><th>ملاحظة</th><th></th></tr></thead><tbody id="fl"></tbody></table></div>`;
+  $('#ff').kind.onchange = e => { $('#ff').category.innerHTML = cats(e.target.value); };
+  reload = async () => { try { const r = await api('/finance');
+    $('#fl').innerHTML = r.map(x => `<tr><td>${esc(x.entry_date)}</td><td>${x.kind === 'expense' ? 'مصروف' : 'إيراد'}</td><td>${esc(x.category)}</td><td>${money2(x.amount_piastres)}</td><td>${esc(x.note || '')}</td><td><button class="danger" data-v="${x.id}">إلغاء</button></td></tr>`).join('') || '<tr><td colspan="6">لا توجد حركات</td></tr>'; } catch (x) { toast(x.message, 1); } };
+  $('#ff').onsubmit = async e => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.request_id = rid;
+    try { await api('/finance', 'POST', d); rid = crypto.randomUUID(); e.target.amount.value = ''; e.target.note.value = ''; toast('تم التسجيل'); } catch (x) { toast(x.message, 1); } };
+  $('#fl').onclick = async e => { const v = e.target.dataset.v; if (!v || !confirm('إلغاء هذه الحركة؟ (تبقى محفوظة في سجل العمليات)')) return;
+    try { await api('/finance/' + v, 'DELETE'); toast('تم الإلغاء'); } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+const RP = { sales: 'تقرير المبيعات', purchases: 'تقرير المشتريات', finance: 'المصروفات والإيرادات', stock: 'أرصدة الخامات', pstock: 'أرصدة المنتجات', production: 'أوامر التصنيع' };
+async function reports() {
+  const now = new Date(); let data = null, label = '';
+  $('#view').innerHTML = `<div class="bar noprint"><h2>التقارير</h2></div><div class="row noprint"><select id="rt">${Object.entries(RP).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+  <input type="date" id="rf" value="${isoD(new Date(now.getFullYear(), now.getMonth(), 1))}"><input type="date" id="rto" value="${isoD(now)}"><button id="rs">عرض</button><button class="ghost" id="rx">تصدير Excel (CSV)</button><button class="ghost" id="rp">طباعة / PDF</button></div><div id="rep"></div>`;
+  reload = () => {};
+  $('#rs').onclick = async () => { try { const t = $('#rt').value; data = await api(`/report?type=${t}&from=${$('#rf').value}&to=${$('#rto').value}`);
+    label = RP[t] + (['stock', 'pstock'].includes(t) ? '' : ` (${$('#rf').value} إلى ${$('#rto').value})`);
+    $('#rep').innerHTML = `<h3>${esc(label)}</h3><div style="overflow-x:auto"><table><thead><tr>${data.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${data.rows.map(r => `<tr>${r.map(v => `<td>${esc(v)}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${data.cols.length}">لا توجد بيانات</td></tr>`}</tbody></table></div>`; } catch (x) { toast(x.message, 1); } };
+  $('#rx').onclick = () => { if (!data) return toast('اعرضي التقرير أولاً', 1);
+    const csv = [data.cols, ...data.rows].map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' })); a.download = `report-${$('#rt').value}.csv`; a.click(); };
+  $('#rp').onclick = () => { if (!data) return toast('اعرضي التقرير أولاً', 1); window.print(); };
 }
 function start() {
   api('/me').then(u => { me = u;
