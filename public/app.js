@@ -12,7 +12,8 @@ const PAGES = {
   warehouses: { t: 'المخازن', api: '/warehouses', f: [['name', 'اسم المخزن', 'name'], ['location', 'الموقع', 'location', '', 'o']] }
 };
 PAGES.suppliers = { t: 'الموردون', api: '/suppliers', f: [['name', 'اسم المورد', 'name'], ['phone', 'الهاتف', 'phone', '', 'o'], ['address', 'العنوان', 'address', '', 'o']] };
-const NAV = [['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون'], ['suppliers', 'الموردون'], ['purchases', 'المشتريات']];
+PAGES.customers = { t: 'العملاء', api: '/customers', f: [['name', 'اسم العميل', 'name'], ['phone', 'الهاتف', 'phone', '', 'o'], ['address', 'العنوان', 'address', '', 'o']] };
+const NAV = [['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون'], ['suppliers', 'الموردون'], ['purchases', 'المشتريات'], ['customers', 'العملاء'], ['sales', 'المبيعات'], ['pstock', 'مخزون المنتجات']];
 const KINDS = { opening: 'رصيد افتتاحي', in: 'دخول', out: 'صرف', damaged: 'تالف', adjust: 'تسوية (+/-)' };
 let me, ws, retry = 0, page = 'products', reload = () => {};
 
@@ -33,7 +34,7 @@ function connect() {
 }
 function go(p) {
   page = p; document.querySelectorAll('.side [data-p]').forEach(b => b.classList.toggle('on', b.dataset.p === p));
-  (p === 'stock' ? stock : p === 'purchases' ? purchases : crud)(p);
+  ({ stock, purchases, sales, pstock }[p] || crud)(p);
 }
 async function crud(p) {
   const P = PAGES[p]; let rows = [];
@@ -92,6 +93,50 @@ async function purchases() {
   reload = async () => { try { const [b, l] = await Promise.all([api('/supplier-balances'), api('/purchases')]);
     $('#due').innerHTML = b.map(r => `<tr><td>${esc(r.name)}</td><td>${r.invoiced / 100}</td><td>${r.paid / 100}</td><td>${(r.invoiced - r.paid) / 100}</td><td>${r.invoiced > r.paid ? `<button class="ghost" data-pay="${r.id}">سداد</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5">أضف موردين أولاً</td></tr>';
     $('#inv').innerHTML = l.map(r => `<tr><td>PI-${r.id}</td><td>${esc(r.created_at)}</td><td>${esc(r.supplier)}</td><td>${esc(r.warehouse)}</td><td>${r.total_piastres / 100}</td></tr>`).join('') || '<tr><td colspan="5">لا توجد فواتير</td></tr>'; } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+async function sales() {
+  let custs = [], whs = [], prods = [];
+  try { [custs, whs, prods] = await Promise.all([api('/customers'), api('/warehouses'), api('/products')]); } catch (x) { toast(x.message, 1); }
+  const opt = a => a.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('');
+  const line = () => `<div class="row ln"><select name="product_id">${opt(prods)}</select><input name="qty" type="number" step="any" min="0" placeholder="الكمية" required><input name="unit_price" type="number" step="any" min="0" placeholder="سعر الوحدة (ج.م)" value="${prods[0] ? prods[0].price_piastres / 100 : ''}" required><button type="button" class="danger rm">حذف</button></div>`;
+  let rid = crypto.randomUUID();
+  $('#view').innerHTML = `<div class="bar"><h2>المبيعات</h2></div>
+  <form id="pi"><div class="row"><select name="customer_id" required>${opt(custs)}</select><select name="warehouse_id" required>${opt(whs)}</select></div>
+  <div id="lines">${line()}</div><button type="button" class="ghost" id="addl">+ إضافة صنف</button>
+  <div class="row" style="margin-top:10px"><input name="discount" type="number" step="any" min="0" placeholder="الخصم (ج.م)"><input name="paid" type="number" step="any" min="0" placeholder="المدفوع الآن (ج.م)"><input name="note" placeholder="ملاحظة"><button>إصدار الفاتورة</button></div></form>
+  <h3>المستحق على العملاء</h3><div style="overflow-x:auto"><table><thead><tr><th>العميل</th><th>إجمالي الفواتير</th><th>المدفوع</th><th>المتبقي</th><th></th></tr></thead><tbody id="due"></tbody></table></div>
+  <h3>آخر الفواتير</h3><div style="overflow-x:auto"><table><thead><tr><th>رقم</th><th>التاريخ</th><th>العميل</th><th>المخزن</th><th>الإجمالي</th></tr></thead><tbody id="inv"></tbody></table></div>`;
+  $('#addl').onclick = () => $('#lines').insertAdjacentHTML('beforeend', line());
+  $('#lines').onclick = e => { if (e.target.classList.contains('rm') && document.querySelectorAll('.ln').length > 1) e.target.closest('.ln').remove(); };
+  $('#lines').onchange = e => { if (e.target.name === 'product_id') { const m = prods.find(x => x.id == e.target.value); e.target.closest('.ln').querySelector('[name=unit_price]').value = m ? m.price_piastres / 100 : ''; } };
+  $('#pi').onsubmit = async e => { e.preventDefault(); const f = e.target;
+    const items = [...document.querySelectorAll('.ln')].map(d => ({ product_id: d.querySelector('[name=product_id]').value, qty: d.querySelector('[name=qty]').value, unit_price: d.querySelector('[name=unit_price]').value }));
+    try { await api('/sales', 'POST', { customer_id: f.customer_id.value, warehouse_id: f.warehouse_id.value, discount: f.discount.value, paid: f.paid.value, note: f.note.value, items, request_id: rid });
+      rid = crypto.randomUUID(); toast('تم إصدار الفاتورة وخصم المنتجات من المخزن'); $('#lines').innerHTML = line(); f.discount.value = f.paid.value = f.note.value = ''; } catch (x) { toast(x.message, 1); } };
+  $('#due').onclick = async e => { const id = e.target.dataset.pay; if (!id) return; const v = prompt('مبلغ التحصيل (ج.م)'); if (!v) return;
+    try { await api('/customer-payments', 'POST', { customer_id: id, amount: v, request_id: crypto.randomUUID() }); toast('تم تسجيل التحصيل'); } catch (x) { toast(x.message, 1); } };
+  reload = async () => { try { const [b, l] = await Promise.all([api('/customer-balances'), api('/sales')]);
+    $('#due').innerHTML = b.map(r => `<tr><td>${esc(r.name)}</td><td>${r.invoiced / 100}</td><td>${r.paid / 100}</td><td>${(r.invoiced - r.paid) / 100}</td><td>${r.invoiced > r.paid ? `<button class="ghost" data-pay="${r.id}">تحصيل</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5">أضف عملاء أولاً</td></tr>';
+    $('#inv').innerHTML = l.map(r => `<tr><td>SI-${r.id}</td><td>${esc(r.created_at)}</td><td>${esc(r.customer)}</td><td>${esc(r.warehouse)}</td><td>${r.total_piastres / 100}</td></tr>`).join('') || '<tr><td colspan="5">لا توجد فواتير</td></tr>'; } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+async function pstock() {
+  let mats = [], whs = [];
+  try { [mats, whs] = await Promise.all([api('/products'), api('/warehouses')]); } catch (x) { toast(x.message, 1); }
+  const opt = a => a.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('');
+  $('#view').innerHTML = `<div class="bar"><h2>مخزون المنتجات</h2></div>
+  <form class="row" id="mv"><select name="product_id" required>${opt(mats)}</select><select name="warehouse_id" required>${opt(whs)}</select>
+  <select name="kind">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+  <input name="qty" type="number" step="any" placeholder="الكمية" required><input name="note" placeholder="ملاحظة"><button>تسجيل الحركة</button></form>
+  <h3>الأرصدة</h3><div style="overflow-x:auto"><table><thead><tr><th>المنتج</th><th>المخزن</th><th>الرصيد</th><th>الحالة</th></tr></thead><tbody id="bal"></tbody></table></div>
+  <h3>آخر الحركات</h3><div style="overflow-x:auto"><table><thead><tr><th>التاريخ</th><th>المنتج</th><th>المخزن</th><th>النوع</th><th>الكمية</th><th>المستخدم</th></tr></thead><tbody id="led"></tbody></table></div>`;
+  reload = async () => { try { const [s, l] = await Promise.all([api('/product-stock'), api('/product-stock/ledger')]);
+    const tot = {}; s.forEach(r => tot[r.product_id] = (tot[r.product_id] || 0) + r.qty);
+    $('#bal').innerHTML = s.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.warehouse)}</td><td>${r.qty}</td><td>${r.qty <= 0 ? 'نفد' : 'متوفر'}</td></tr>`).join('') || '<tr><td colspan="4">أضف خامات ومخازن أولاً</td></tr>';
+    $('#led').innerHTML = l.map(r => `<tr><td>${esc(r.created_at)}</td><td>${esc(r.product)}</td><td>${esc(r.warehouse)}</td><td>${(KINDS[r.kind] || 'بيع')}</td><td>${r.qty}</td><td>${esc(r.user)}</td></tr>`).join('') || '<tr><td colspan="6">لا توجد حركات</td></tr>'; } catch (x) { toast(x.message, 1); } };
+  $('#mv').onsubmit = async e => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.request_id = crypto.randomUUID();
+    try { await api('/product-stock/move', 'POST', d); e.target.qty.value = ''; e.target.note.value = ''; toast('تم تسجيل الحركة'); } catch (x) { toast(x.message, 1); } };
   reload();
 }
 function start() {
