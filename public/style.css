@@ -13,3 +13,4 @@ form.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));g
 #toast span{background:var(--lav);color:#1a1030;padding:12px 18px;border-radius:12px;display:inline-block}#toast .e{background:#ffb4ab}
 @media(max-width:720px){.shell{grid-template-columns:1fr}.side{grid-auto-flow:column;overflow-x:auto}}
 select,textarea{font:inherit;min-height:48px;border-radius:12px;border:1px solid #4a3a7a;padding:0 10px;background:#1f1438;color:#fff}h3{color:#c9b8ff}
+div.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
