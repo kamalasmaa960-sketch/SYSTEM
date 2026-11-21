@@ -11,7 +11,8 @@ const PAGES = {
   materials: { t: 'الخامات', api: '/materials', f: [['sku', 'الكود', 'sku'], ['name', 'الاسم', 'name'], ['unit', 'الوحدة (متر، كيلو...)', 'unit'], ['unit_cost', 'سعر الشراء (ج.م)', 'unit_cost_piastres', 'm'], ['min_stock', 'حد إعادة الطلب', 'min_stock', 'n']] },
   warehouses: { t: 'المخازن', api: '/warehouses', f: [['name', 'اسم المخزن', 'name'], ['location', 'الموقع', 'location', '', 'o']] }
 };
-const NAV = [['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون']];
+PAGES.suppliers = { t: 'الموردون', api: '/suppliers', f: [['name', 'اسم المورد', 'name'], ['phone', 'الهاتف', 'phone', '', 'o'], ['address', 'العنوان', 'address', '', 'o']] };
+const NAV = [['products', 'المنتجات'], ['materials', 'الخامات'], ['warehouses', 'المخازن'], ['stock', 'المخزون'], ['suppliers', 'الموردون'], ['purchases', 'المشتريات']];
 const KINDS = { opening: 'رصيد افتتاحي', in: 'دخول', out: 'صرف', damaged: 'تالف', adjust: 'تسوية (+/-)' };
 let me, ws, retry = 0, page = 'products', reload = () => {};
 
@@ -32,7 +33,7 @@ function connect() {
 }
 function go(p) {
   page = p; document.querySelectorAll('.side [data-p]').forEach(b => b.classList.toggle('on', b.dataset.p === p));
-  (p === 'stock' ? stock : crud)(p);
+  (p === 'stock' ? stock : p === 'purchases' ? purchases : crud)(p);
 }
 async function crud(p) {
   const P = PAGES[p]; let rows = [];
@@ -65,6 +66,32 @@ async function stock() {
     $('#led').innerHTML = l.map(r => `<tr><td>${esc(r.created_at)}</td><td>${esc(r.material)}</td><td>${esc(r.warehouse)}</td><td>${KINDS[r.kind]}</td><td>${r.qty}</td><td>${esc(r.user)}</td></tr>`).join('') || '<tr><td colspan="6">لا توجد حركات</td></tr>'; } catch (x) { toast(x.message, 1); } };
   $('#mv').onsubmit = async e => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.request_id = crypto.randomUUID();
     try { await api('/stock/move', 'POST', d); e.target.qty.value = ''; e.target.note.value = ''; toast('تم تسجيل الحركة'); } catch (x) { toast(x.message, 1); } };
+  reload();
+}
+async function purchases() {
+  let sups = [], whs = [], mats = [];
+  try { [sups, whs, mats] = await Promise.all([api('/suppliers'), api('/warehouses'), api('/materials')]); } catch (x) { toast(x.message, 1); }
+  const opt = a => a.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('');
+  const line = () => `<div class="row ln"><select name="material_id">${opt(mats)}</select><input name="qty" type="number" step="any" min="0" placeholder="الكمية" required><input name="unit_cost" type="number" step="any" min="0" placeholder="سعر الوحدة (ج.م)" value="${mats[0] ? mats[0].unit_cost_piastres / 100 : ''}" required><button type="button" class="danger rm">حذف</button></div>`;
+  let rid = crypto.randomUUID();
+  $('#view').innerHTML = `<div class="bar"><h2>المشتريات</h2></div>
+  <form id="pi"><div class="row"><select name="supplier_id" required>${opt(sups)}</select><select name="warehouse_id" required>${opt(whs)}</select></div>
+  <div id="lines">${line()}</div><button type="button" class="ghost" id="addl">+ إضافة صنف</button>
+  <div class="row" style="margin-top:10px"><input name="discount" type="number" step="any" min="0" placeholder="الخصم (ج.م)"><input name="paid" type="number" step="any" min="0" placeholder="المدفوع الآن (ج.م)"><input name="note" placeholder="ملاحظة"><button>اعتماد الفاتورة واستلامها</button></div></form>
+  <h3>المستحق للموردين</h3><div style="overflow-x:auto"><table><thead><tr><th>المورد</th><th>إجمالي الفواتير</th><th>المدفوع</th><th>المتبقي</th><th></th></tr></thead><tbody id="due"></tbody></table></div>
+  <h3>آخر الفواتير</h3><div style="overflow-x:auto"><table><thead><tr><th>رقم</th><th>التاريخ</th><th>المورد</th><th>المخزن</th><th>الإجمالي</th></tr></thead><tbody id="inv"></tbody></table></div>`;
+  $('#addl').onclick = () => $('#lines').insertAdjacentHTML('beforeend', line());
+  $('#lines').onclick = e => { if (e.target.classList.contains('rm') && document.querySelectorAll('.ln').length > 1) e.target.closest('.ln').remove(); };
+  $('#lines').onchange = e => { if (e.target.name === 'material_id') { const m = mats.find(x => x.id == e.target.value); e.target.closest('.ln').querySelector('[name=unit_cost]').value = m ? m.unit_cost_piastres / 100 : ''; } };
+  $('#pi').onsubmit = async e => { e.preventDefault(); const f = e.target;
+    const items = [...document.querySelectorAll('.ln')].map(d => ({ material_id: d.querySelector('[name=material_id]').value, qty: d.querySelector('[name=qty]').value, unit_cost: d.querySelector('[name=unit_cost]').value }));
+    try { await api('/purchases', 'POST', { supplier_id: f.supplier_id.value, warehouse_id: f.warehouse_id.value, discount: f.discount.value, paid: f.paid.value, note: f.note.value, items, request_id: rid });
+      rid = crypto.randomUUID(); toast('تم اعتماد الفاتورة وإضافة الخامات للمخزن'); $('#lines').innerHTML = line(); f.discount.value = f.paid.value = f.note.value = ''; } catch (x) { toast(x.message, 1); } };
+  $('#due').onclick = async e => { const id = e.target.dataset.pay; if (!id) return; const v = prompt('مبلغ السداد (ج.م)'); if (!v) return;
+    try { await api('/supplier-payments', 'POST', { supplier_id: id, amount: v, request_id: crypto.randomUUID() }); toast('تم تسجيل السداد'); } catch (x) { toast(x.message, 1); } };
+  reload = async () => { try { const [b, l] = await Promise.all([api('/supplier-balances'), api('/purchases')]);
+    $('#due').innerHTML = b.map(r => `<tr><td>${esc(r.name)}</td><td>${r.invoiced / 100}</td><td>${r.paid / 100}</td><td>${(r.invoiced - r.paid) / 100}</td><td>${r.invoiced > r.paid ? `<button class="ghost" data-pay="${r.id}">سداد</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5">أضف موردين أولاً</td></tr>';
+    $('#inv').innerHTML = l.map(r => `<tr><td>PI-${r.id}</td><td>${esc(r.created_at)}</td><td>${esc(r.supplier)}</td><td>${esc(r.warehouse)}</td><td>${r.total_piastres / 100}</td></tr>`).join('') || '<tr><td colspan="5">لا توجد فواتير</td></tr>'; } catch (x) { toast(x.message, 1); } };
   reload();
 }
 function start() {
