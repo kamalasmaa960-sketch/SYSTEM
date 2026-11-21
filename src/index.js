@@ -39,6 +39,7 @@ async function newSession(env, userId) {
 
 const SPEC = {
   warehouses: [['name', 'name', 's', 80, 'الاسم'], ['location', 'location', 'o', 200, 'الموقع']],
+  customers: [['name', 'name', 's', 80, 'الاسم'], ['phone', 'phone', 'o', 30, 'الهاتف'], ['address', 'address', 'o', 200, 'العنوان']],
   suppliers: [['name', 'name', 's', 80, 'الاسم'], ['phone', 'phone', 'o', 30, 'الهاتف'], ['address', 'address', 'o', 200, 'العنوان']],
   materials: [['sku', 'sku', 's', 40, 'الكود'], ['name', 'name', 's', 120, 'الاسم'], ['unit', 'unit', 's', 20, 'الوحدة'],
     ['unit_cost', 'unit_cost_piastres', 'm', 0, 'سعر الشراء'], ['min_stock', 'min_stock', 'n', 0, 'حد إعادة الطلب']]
@@ -146,7 +147,7 @@ async function handle(req, env) {
       await audit(env, user, 'archive', 'products', id, old); await broadcast(env, 'products', { by: user.id }); return J({ ok: true });
     }
   }
-  const gm = p.match(/^\/api\/(warehouses|materials|suppliers)(?:\/(\d+))?$/);
+  const gm = p.match(/^\/api\/(warehouses|materials|suppliers|customers)(?:\/(\d+))?$/);
   if (gm) return crud(env, user, m, gm[1], gm[2] ? +gm[2] : 0, body);
   if (p === '/api/stock' && m === 'GET') {
     if (!can(user, 'stock.view')) throw new HttpErr(403, 'غير مصرح');
@@ -244,6 +245,92 @@ async function handle(req, env) {
     await db.batch(st);
     await audit(env, user, 'purchase.receive', 'purchase_invoices', id, null, { sid, wid, total, paid });
     await broadcast(env, 'purchases'); return J({ ok: true, id }, 201);
+  }
+  if (p === '/api/product-stock' && m === 'GET') {
+    if (!can(user, 'pstock.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT p.id product_id,p.sku,p.name,w.id warehouse_id,w.name warehouse,COALESCE(SUM(i.qty),0) qty
+      FROM products p CROSS JOIN warehouses w LEFT JOIN product_movements i ON i.product_id=p.id AND i.warehouse_id=w.id
+      WHERE p.status='active' AND w.status='active' GROUP BY p.id,w.id ORDER BY p.name,w.name`).all()).results);
+  }
+  if (p === '/api/product-stock/ledger' && m === 'GET') {
+    if (!can(user, 'pstock.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT i.id,i.qty,i.kind,i.note,i.created_at,p.name product,w.name warehouse,u.name user
+      FROM product_movements i JOIN products p ON p.id=i.product_id JOIN warehouses w ON w.id=i.warehouse_id
+      LEFT JOIN users u ON u.id=i.user_id ORDER BY i.id DESC LIMIT 50`).all()).results);
+  }
+  if (p === '/api/product-stock/move' && m === 'POST') {
+    if (!can(user, 'pstock.move')) throw new HttpErr(403, 'غير مصرح');
+    const kind = body.kind, sign = { opening: 1, in: 1, out: -1, damaged: -1, adjust: 0 }[kind];
+    if (sign === undefined) throw new HttpErr(400, 'نوع الحركة غير صالح');
+    let q = Number(body.qty); if (!Number.isFinite(q) || q === 0 || (sign && q < 0)) throw new HttpErr(400, 'الكمية غير صالحة');
+    if (sign) q *= sign;
+    const pid = +body.product_id, wid = +body.warehouse_id, rid = str(body.request_id, 64, 'المعرف');
+    if (!(await env.DB.prepare("SELECT id FROM products WHERE id=? AND status='active'").bind(pid).first()) ||
+        !(await env.DB.prepare("SELECT id FROM warehouses WHERE id=? AND status='active'").bind(wid).first())) throw new HttpErr(400, 'المنتج أو المخزن غير موجود');
+    if (await env.DB.prepare('SELECT 1 x FROM product_movements WHERE request_id=?').bind(rid).first()) return J({ ok: true, duplicate: true });
+    const r = await env.DB.prepare(`INSERT INTO product_movements(product_id,warehouse_id,qty,kind,note,user_id,request_id)
+      SELECT ?,?,?,?,?,?,? WHERE (SELECT COALESCE(SUM(qty),0) FROM product_movements WHERE product_id=? AND warehouse_id=?)+? >= 0`)
+      .bind(pid, wid, q, kind, body.note ? String(body.note).slice(0, 200) : null, user.id, rid, pid, wid, q).run();
+    if (!r.meta.changes) throw new HttpErr(409, 'رصيد المنتج في هذا المخزن غير كافٍ');
+    await audit(env, user, 'pstock.' + kind, 'product_movements', r.meta.last_row_id, null, { pid, wid, q }); await broadcast(env, 'pstock'); return J({ ok: true }, 201);
+  }
+  if (p === '/api/sales' && m === 'GET') {
+    if (!can(user, 'sales.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT i.id,i.total_piastres,i.created_at,c.name customer,w.name warehouse FROM sales_invoices i
+      JOIN customers c ON c.id=i.customer_id JOIN warehouses w ON w.id=i.warehouse_id WHERE i.status='issued' ORDER BY i.id DESC LIMIT 50`).all()).results);
+  }
+  if (p === '/api/customer-balances' && m === 'GET') {
+    if (!can(user, 'sales.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT c.id,c.name,
+      COALESCE((SELECT SUM(total_piastres) FROM sales_invoices WHERE customer_id=c.id AND status='issued'),0) invoiced,
+      COALESCE((SELECT SUM(amount_piastres) FROM customer_payments WHERE customer_id=c.id),0) paid FROM customers c WHERE c.status='active' ORDER BY c.name`).all()).results);
+  }
+  if (p === '/api/customer-payments' && m === 'POST') {
+    if (!can(user, 'sales.collect')) throw new HttpErr(403, 'غير مصرح');
+    const cid = +body.customer_id, amt = money(body.amount, 'المبلغ'), rid = str(body.request_id, 64, 'المعرف');
+    if (amt <= 0) throw new HttpErr(400, 'المبلغ يجب أن يكون أكبر من صفر');
+    if (!(await env.DB.prepare("SELECT id FROM customers WHERE id=? AND status='active'").bind(cid).first())) throw new HttpErr(400, 'العميل غير موجود');
+    if (await env.DB.prepare('SELECT 1 x FROM customer_payments WHERE request_id=?').bind(rid).first()) return J({ ok: true, duplicate: true });
+    const r = await env.DB.prepare(`INSERT INTO customer_payments(customer_id,amount_piastres,method,note,user_id,request_id)
+      SELECT ?,?,?,?,?,? WHERE ? <= COALESCE((SELECT SUM(total_piastres) FROM sales_invoices WHERE customer_id=? AND status='issued'),0)
+        - COALESCE((SELECT SUM(amount_piastres) FROM customer_payments WHERE customer_id=?),0)`)
+      .bind(cid, amt, String(body.method || 'cash').slice(0, 20), body.note ? String(body.note).slice(0, 200) : null, user.id, rid, amt, cid, cid).run();
+    if (!r.meta.changes) throw new HttpErr(409, 'المبلغ أكبر من المستحق على العميل');
+    await audit(env, user, 'customer.payment', 'customer_payments', r.meta.last_row_id, null, { cid, amt }); await broadcast(env, 'sales'); return J({ ok: true }, 201);
+  }
+  if (p === '/api/sales' && m === 'POST') {
+    if (!can(user, 'sales.create')) throw new HttpErr(403, 'غير مصرح');
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length || items.length > 50) throw new HttpErr(400, 'أضف من 1 إلى 50 صنفاً');
+    const cid = +body.customer_id, wid = +body.warehouse_id, rid = str(body.request_id, 64, 'المعرف');
+    const lines = items.map(it => { const q = Number(it.qty); if (!Number.isFinite(q) || q <= 0) throw new HttpErr(400, 'كمية غير صالحة'); const c = money(it.unit_price, 'سعر الوحدة'); return { pid: +it.product_id, q, c, t: Math.round(q * c) }; });
+    const ids = [...new Set(lines.map(l => l.pid))], ph = ids.map(() => '?').join(',');
+    const prods = (await env.DB.prepare(`SELECT id,name FROM products WHERE status='active' AND id IN (${ph})`).bind(...ids).all()).results;
+    const cust = await env.DB.prepare("SELECT id FROM customers WHERE id=? AND status='active'").bind(cid).first();
+    const wh = await env.DB.prepare("SELECT id FROM warehouses WHERE id=? AND status='active'").bind(wid).first();
+    if (prods.length !== ids.length || !cust || !wh) throw new HttpErr(400, 'العميل أو المخزن أو أحد المنتجات غير صحيح');
+    const old = await env.DB.prepare('SELECT id,status FROM sales_invoices WHERE request_id=?').bind(rid).first();
+    if (old?.status === 'issued') return J({ ok: true, duplicate: true, id: old.id });
+    const need = {}; lines.forEach(l => need[l.pid] = (need[l.pid] || 0) + l.q);
+    const bal = (await env.DB.prepare(`SELECT product_id,COALESCE(SUM(qty),0) q FROM product_movements WHERE warehouse_id=? AND product_id IN (${ph}) GROUP BY product_id`).bind(wid, ...ids).all()).results;
+    for (const pr of prods) if ((bal.find(b => b.product_id === pr.id)?.q || 0) < need[pr.id] - 1e-9) throw new HttpErr(409, `الرصيد غير كافٍ للمنتج: ${pr.name}`);
+    const sub = lines.reduce((a, l) => a + l.t, 0), disc = body.discount ? money(body.discount, 'الخصم') : 0, paid = body.paid ? money(body.paid, 'المدفوع') : 0;
+    if (disc > sub) throw new HttpErr(400, 'الخصم أكبر من الإجمالي');
+    const total = sub - disc; if (paid > total) throw new HttpErr(400, 'المدفوع أكبر من إجمالي الفاتورة');
+    const id = old ? old.id : (await env.DB.prepare('INSERT INTO sales_invoices(customer_id,warehouse_id,subtotal_piastres,discount_piastres,total_piastres,note,created_by,request_id) VALUES(?,?,?,?,?,?,?,?)')
+      .bind(cid, wid, sub, disc, total, body.note ? String(body.note).slice(0, 200) : null, user.id, rid).run()).meta.last_row_id;
+    const db = env.DB, st = [];
+    lines.forEach((l, i) => {
+      st.push(db.prepare('INSERT INTO sales_items(invoice_id,product_id,qty,unit_price_piastres,line_total_piastres) VALUES(?,?,?,?,?)').bind(id, l.pid, l.q, l.c, l.t));
+      st.push(db.prepare("INSERT INTO product_movements(product_id,warehouse_id,qty,kind,note,user_id,request_id) VALUES(?,?,?,'sale',?,?,?)").bind(l.pid, wid, -l.q, `فاتورة بيع #${id}`, user.id, `si-${id}-${i}`));
+    });
+    if (paid) st.push(db.prepare('INSERT INTO customer_payments(customer_id,invoice_id,amount_piastres,method,user_id,request_id) VALUES(?,?,?,?,?,?)').bind(cid, id, paid, 'cash', user.id, `sip-${id}`));
+    // حارس: إن أصبح أي رصيد سالباً (بيع متزامن) يفشل الإدخال فتُلغى العملية كلها
+    st.push(db.prepare('INSERT INTO _guard(x) SELECT NULL WHERE EXISTS (SELECT 1 FROM product_movements WHERE warehouse_id=? GROUP BY product_id HAVING SUM(qty) < -0.000001)').bind(wid));
+    st.push(db.prepare("UPDATE sales_invoices SET status='issued',issued_at=CURRENT_TIMESTAMP WHERE id=? AND status='draft'").bind(id));
+    try { await db.batch(st); } catch (e) { if (/NOT NULL/i.test(e.message)) throw new HttpErr(409, 'الرصيد لم يعد كافياً، حاول مرة أخرى'); throw e; }
+    await audit(env, user, 'sale.issue', 'sales_invoices', id, null, { cid, wid, total, paid });
+    await broadcast(env, 'sales'); return J({ ok: true, id }, 201);
   }
   throw new HttpErr(404, 'غير موجود');
 }
