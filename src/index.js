@@ -39,6 +39,7 @@ async function newSession(env, userId) {
 
 const SPEC = {
   warehouses: [['name', 'name', 's', 80, 'الاسم'], ['location', 'location', 'o', 200, 'الموقع']],
+  stage_defs: [['name', 'name', 's', 60, 'اسم المرحلة'], ['position', 'position', 'n', 0, 'الترتيب']],
   customers: [['name', 'name', 's', 80, 'الاسم'], ['phone', 'phone', 'o', 30, 'الهاتف'], ['address', 'address', 'o', 200, 'العنوان']],
   suppliers: [['name', 'name', 's', 80, 'الاسم'], ['phone', 'phone', 'o', 30, 'الهاتف'], ['address', 'address', 'o', 200, 'العنوان']],
   materials: [['sku', 'sku', 's', 40, 'الكود'], ['name', 'name', 's', 120, 'الاسم'], ['unit', 'unit', 's', 20, 'الوحدة'],
@@ -74,6 +75,14 @@ async function crud(env, user, m, ent, id, body) {
   }
   throw new HttpErr(405, 'طريقة غير مدعومة');
 }
+
+const isoDate = d => d.toISOString().slice(0, 10);
+function period(url) {
+  const now = new Date(), f = url.searchParams.get('from') || isoDate(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))), t = url.searchParams.get('to') || isoDate(now);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(f) || !/^\d{4}-\d{2}-\d{2}$/.test(t) || f > t) throw new HttpErr(400, 'الفترة غير صالحة');
+  return [f, t];
+}
+const ORD = { open: 'جديد', in_progress: 'قيد التنفيذ', completed: 'مكتمل', cancelled: 'ملغي' };
 
 async function handle(req, env) {
   const url = new URL(req.url), p = url.pathname, m = req.method;
@@ -147,7 +156,7 @@ async function handle(req, env) {
       await audit(env, user, 'archive', 'products', id, old); await broadcast(env, 'products', { by: user.id }); return J({ ok: true });
     }
   }
-  const gm = p.match(/^\/api\/(warehouses|materials|suppliers|customers)(?:\/(\d+))?$/);
+  const gm = p.match(/^\/api\/(warehouses|materials|suppliers|customers|stage_defs)(?:\/(\d+))?$/);
   if (gm) return crud(env, user, m, gm[1], gm[2] ? +gm[2] : 0, body);
   if (p === '/api/stock' && m === 'GET') {
     if (!can(user, 'stock.view')) throw new HttpErr(403, 'غير مصرح');
@@ -331,6 +340,172 @@ async function handle(req, env) {
     try { await db.batch(st); } catch (e) { if (/NOT NULL/i.test(e.message)) throw new HttpErr(409, 'الرصيد لم يعد كافياً، حاول مرة أخرى'); throw e; }
     await audit(env, user, 'sale.issue', 'sales_invoices', id, null, { cid, wid, total, paid });
     await broadcast(env, 'sales'); return J({ ok: true, id }, 201);
+  }
+  if (p === '/api/bom' && m === 'GET') {
+    if (!can(user, 'bom.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare('SELECT c.material_id,c.qty_per_unit,m.name,m.unit FROM product_components c JOIN materials m ON m.id=c.material_id WHERE c.product_id=? ORDER BY m.name')
+      .bind(+url.searchParams.get('product_id')).all()).results);
+  }
+  if (p === '/api/bom' && m === 'PUT') {
+    if (!can(user, 'bom.edit')) throw new HttpErr(403, 'غير مصرح');
+    const pid = +body.product_id, items = Array.isArray(body.items) ? body.items : [];
+    if (items.length > 50) throw new HttpErr(400, 'عدد الخامات كبير');
+    const ls = items.map(it => { const q = Number(it.qty); if (!Number.isFinite(q) || q <= 0) throw new HttpErr(400, 'كمية غير صالحة في الوصفة'); return { mid: +it.material_id, q }; });
+    const ids = ls.map(l => l.mid); if (new Set(ids).size !== ids.length) throw new HttpErr(400, 'خامة مكررة في الوصفة');
+    if (!(await env.DB.prepare("SELECT id FROM products WHERE id=? AND status='active'").bind(pid).first())) throw new HttpErr(400, 'المنتج غير موجود');
+    if (ids.length) { const c = await env.DB.prepare(`SELECT COUNT(*) c FROM materials WHERE status='active' AND id IN (${ids.map(() => '?').join(',')})`).bind(...ids).first(); if (c.c !== ids.length) throw new HttpErr(400, 'إحدى الخامات غير موجودة'); }
+    await env.DB.batch([env.DB.prepare('DELETE FROM product_components WHERE product_id=?').bind(pid),
+      ...ls.map(l => env.DB.prepare('INSERT INTO product_components(product_id,material_id,qty_per_unit) VALUES(?,?,?)').bind(pid, l.mid, l.q))]);
+    await audit(env, user, 'bom.save', 'product_components', pid, null, ls); await broadcast(env, 'bom'); return J({ ok: true });
+  }
+  if (p === '/api/production' && m === 'GET') {
+    if (!can(user, 'production.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare(`SELECT o.id,o.status,o.qty_planned,o.qty_good,o.qty_scrap,o.due_date,o.total_cost_piastres,p.name product,
+      (SELECT COUNT(*) FROM production_order_stages WHERE order_id=o.id AND status='done') done,(SELECT COUNT(*) FROM production_order_stages WHERE order_id=o.id) total
+      FROM production_orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 50`).all()).results);
+  }
+  if (p === '/api/production' && m === 'POST') {
+    if (!can(user, 'production.create')) throw new HttpErr(403, 'غير مصرح');
+    const pid = +body.product_id, wid = +body.warehouse_id, rid = str(body.request_id, 64, 'المعرف'), qty = Number(body.qty);
+    if (!Number.isFinite(qty) || qty <= 0) throw new HttpErr(400, 'الكمية غير صالحة');
+    const due = body.due_date ? String(body.due_date) : null; if (due && !/^\d{4}-\d{2}-\d{2}$/.test(due)) throw new HttpErr(400, 'تاريخ غير صالح');
+    if (!(await env.DB.prepare("SELECT id FROM products WHERE id=? AND status='active'").bind(pid).first()) ||
+        !(await env.DB.prepare("SELECT id FROM warehouses WHERE id=? AND status='active'").bind(wid).first())) throw new HttpErr(400, 'المنتج أو المخزن غير موجود');
+    const ex = await env.DB.prepare('SELECT id FROM production_orders WHERE request_id=?').bind(rid).first();
+    if (ex) return J({ ok: true, duplicate: true, id: ex.id });
+    if (!(await env.DB.prepare('SELECT COUNT(*) c FROM product_components WHERE product_id=?').bind(pid).first()).c) throw new HttpErr(400, 'حدّد وصفة التصنيع للمنتج أولاً');
+    const defs = (await env.DB.prepare("SELECT name,position FROM stage_defs WHERE status='active' ORDER BY position,id").all()).results;
+    const st = [env.DB.prepare('INSERT INTO production_orders(product_id,warehouse_id,qty_planned,due_date,note,created_by,request_id) VALUES(?,?,?,?,?,?,?)')
+      .bind(pid, wid, qty, due, body.note ? String(body.note).slice(0, 200) : null, user.id, rid)];
+    defs.forEach(d => st.push(env.DB.prepare('INSERT INTO production_order_stages(order_id,name,position) SELECT id,?,? FROM production_orders WHERE request_id=?').bind(d.name, d.position, rid)));
+    await env.DB.batch(st);
+    const id = (await env.DB.prepare('SELECT id FROM production_orders WHERE request_id=?').bind(rid).first()).id;
+    await audit(env, user, 'production.create', 'production_orders', id, null, { pid, wid, qty }); await broadcast(env, 'production'); return J({ ok: true, id }, 201);
+  }
+  const po = p.match(/^\/api\/production\/(\d+)(?:\/(stage|complete|cancel))?$/);
+  if (po) {
+    const id = +po[1], act = po[2];
+    const o = await env.DB.prepare('SELECT o.*,p.name product,w.name warehouse FROM production_orders o JOIN products p ON p.id=o.product_id JOIN warehouses w ON w.id=o.warehouse_id WHERE o.id=?').bind(id).first();
+    if (!o) throw new HttpErr(404, 'غير موجود');
+    if (!act && m === 'GET') {
+      if (!can(user, 'production.view')) throw new HttpErr(403, 'غير مصرح');
+      const stages = (await env.DB.prepare('SELECT id,name,position,status,done_at FROM production_order_stages WHERE order_id=? ORDER BY position,id').bind(id).all()).results;
+      const mats = (await env.DB.prepare(`SELECT c.material_id,m.name,m.unit,c.qty_per_unit,
+        COALESCE((SELECT SUM(qty) FROM inventory_movements WHERE material_id=c.material_id AND warehouse_id=?),0) have
+        FROM product_components c JOIN materials m ON m.id=c.material_id WHERE c.product_id=? ORDER BY m.name`).bind(o.warehouse_id, o.product_id).all()).results;
+      return J({ order: o, stages, mats });
+    }
+    if (m !== 'POST' || !act) throw new HttpErr(405, 'طريقة غير مدعومة');
+    if (!['open', 'in_progress'].includes(o.status)) throw new HttpErr(409, 'هذا الأمر مغلق');
+    if (act === 'stage') {
+      if (!can(user, 'production.update')) throw new HttpErr(403, 'غير مصرح');
+      const s = await env.DB.prepare('SELECT * FROM production_order_stages WHERE id=? AND order_id=?').bind(+body.stage_id, id).first();
+      if (!s || s.status !== 'pending') throw new HttpErr(400, 'المرحلة غير صالحة');
+      if (await env.DB.prepare("SELECT 1 x FROM production_order_stages WHERE order_id=? AND status='pending' AND (position<? OR (position=? AND id<?))").bind(id, s.position, s.position, s.id).first())
+        throw new HttpErr(409, 'أكمل المراحل السابقة أولاً');
+      await env.DB.batch([env.DB.prepare("UPDATE production_order_stages SET status='done',done_at=CURRENT_TIMESTAMP,done_by=? WHERE id=?").bind(user.id, s.id),
+        env.DB.prepare("UPDATE production_orders SET status='in_progress',started_at=COALESCE(started_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(id)]);
+      await audit(env, user, 'production.stage', 'production_orders', id, null, { stage: s.name }); await broadcast(env, 'production'); return J({ ok: true });
+    }
+    if (act === 'cancel') {
+      if (!can(user, 'production.cancel')) throw new HttpErr(403, 'غير مصرح');
+      await env.DB.prepare("UPDATE production_orders SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('open','in_progress')").bind(id).run();
+      await audit(env, user, 'production.cancel', 'production_orders', id); await broadcast(env, 'production'); return J({ ok: true });
+    }
+    if (!can(user, 'production.complete')) throw new HttpErr(403, 'غير مصرح');
+    if ((await env.DB.prepare("SELECT COUNT(*) c FROM production_order_stages WHERE order_id=? AND status='pending'").bind(id).first()).c) throw new HttpErr(409, 'أكمل كل مراحل التصنيع أولاً');
+    const good = body.qty_good === '' || body.qty_good == null ? 0 : num(body.qty_good, 'الكمية الجيدة'), scrap = body.qty_scrap === '' || body.qty_scrap == null ? 0 : num(body.qty_scrap, 'الكمية التالفة');
+    if (good + scrap <= 0) throw new HttpErr(400, 'أدخل كمية منتجة أو تالفة');
+    const labor = body.labor ? money(body.labor, 'العمالة') : 0, over = body.overhead ? money(body.overhead, 'التشغيل') : 0;
+    const comps = (await env.DB.prepare('SELECT c.material_id,c.qty_per_unit,m.name,m.unit_cost_piastres FROM product_components c JOIN materials m ON m.id=c.material_id WHERE c.product_id=?').bind(o.product_id).all()).results;
+    if (!comps.length) throw new HttpErr(400, 'لا توجد وصفة تصنيع لهذا المنتج');
+    const used = good + scrap, bal = (await env.DB.prepare('SELECT material_id,COALESCE(SUM(qty),0) q FROM inventory_movements WHERE warehouse_id=? GROUP BY material_id').bind(o.warehouse_id).all()).results;
+    const short = comps.filter(c => (bal.find(b => b.material_id === c.material_id)?.q || 0) < used * c.qty_per_unit - 1e-9).map(c => c.name);
+    if (short.length) throw new HttpErr(409, `خامات غير كافية في المخزن: ${short.join('، ')}`);
+    const st = [env.DB.prepare("INSERT INTO _guard(x) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM production_orders WHERE id=? AND status IN ('open','in_progress'))").bind(id)];
+    let matCost = 0;
+    comps.forEach((c, i) => { const q = used * c.qty_per_unit; matCost += Math.round(q * c.unit_cost_piastres);
+      st.push(env.DB.prepare("INSERT INTO inventory_movements(material_id,warehouse_id,qty,kind,note,user_id,request_id) VALUES(?,?,?,'out',?,?,?)").bind(c.material_id, o.warehouse_id, -q, `أمر تصنيع #${id}`, user.id, `po-${id}-m${i}`)); });
+    if (good > 0) st.push(env.DB.prepare("INSERT INTO product_movements(product_id,warehouse_id,qty,kind,note,user_id,request_id) VALUES(?,?,?,'in',?,?,?)").bind(o.product_id, o.warehouse_id, good, `أمر تصنيع #${id}`, user.id, `po-${id}-p`));
+    st.push(env.DB.prepare('INSERT INTO _guard(x) SELECT NULL WHERE EXISTS (SELECT 1 FROM inventory_movements WHERE warehouse_id=? GROUP BY material_id HAVING SUM(qty) < -0.000001)').bind(o.warehouse_id));
+    st.push(env.DB.prepare("UPDATE production_orders SET status='completed',qty_good=?,qty_scrap=?,labor_piastres=?,overhead_piastres=?,material_cost_piastres=?,total_cost_piastres=?,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(good, scrap, labor, over, matCost, matCost + labor + over, id));
+    try { await env.DB.batch(st); } catch (e) { if (/NOT NULL/i.test(e.message)) throw new HttpErr(409, 'تغيّرت الأرصدة أو أُغلق الأمر، حدّث الصفحة وحاول مرة أخرى'); throw e; }
+    await audit(env, user, 'production.complete', 'production_orders', id, null, { good, scrap, matCost, labor, over }); await broadcast(env, 'production'); await broadcast(env, 'stock'); return J({ ok: true });
+  }
+  if (p === '/api/finance' && m === 'GET') {
+    if (!can(user, 'finance.view')) throw new HttpErr(403, 'غير مصرح');
+    return J((await env.DB.prepare("SELECT id,kind,category,amount_piastres,entry_date,note FROM finance_entries WHERE status='active' ORDER BY entry_date DESC,id DESC LIMIT 100").all()).results);
+  }
+  if (p === '/api/finance' && m === 'POST') {
+    if (!can(user, 'finance.create')) throw new HttpErr(403, 'غير مصرح');
+    const kind = body.kind; if (!['expense', 'revenue'].includes(kind)) throw new HttpErr(400, 'نوع غير صالح');
+    const cat = str(body.category, 40, 'التصنيف'), amt = money(body.amount, 'المبلغ'), rid = str(body.request_id, 64, 'المعرف'), dt = String(body.entry_date || '');
+    if (amt <= 0) throw new HttpErr(400, 'المبلغ يجب أن يكون أكبر من صفر');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) throw new HttpErr(400, 'تاريخ غير صالح');
+    let r; try { r = await env.DB.prepare('INSERT INTO finance_entries(kind,category,amount_piastres,entry_date,note,user_id,request_id) VALUES(?,?,?,?,?,?,?)')
+      .bind(kind, cat, amt, dt, body.note ? String(body.note).slice(0, 200) : null, user.id, rid).run(); }
+    catch (e) { if (/UNIQUE/i.test(e.message)) return J({ ok: true, duplicate: true }); throw e; }
+    await audit(env, user, 'finance.' + kind, 'finance_entries', r.meta.last_row_id, null, { cat, amt, dt }); await broadcast(env, 'finance'); return J({ ok: true }, 201);
+  }
+  const fm = p.match(/^\/api\/finance\/(\d+)$/);
+  if (fm && m === 'DELETE') {
+    if (!can(user, 'finance.void')) throw new HttpErr(403, 'غير مصرح');
+    const old = await env.DB.prepare("SELECT * FROM finance_entries WHERE id=? AND status='active'").bind(+fm[1]).first();
+    if (!old) throw new HttpErr(404, 'غير موجود');
+    await env.DB.prepare("UPDATE finance_entries SET status='void' WHERE id=?").bind(old.id).run();
+    await audit(env, user, 'finance.void', 'finance_entries', old.id, old); await broadcast(env, 'finance'); return J({ ok: true });
+  }
+  if (p === '/api/dashboard' && m === 'GET') {
+    if (!can(user, 'dashboard.view')) throw new HttpErr(403, 'غير مصرح');
+    const [f, t] = period(url), db = env.DB, one = (sql, ...a) => db.prepare(sql).bind(...a).first(), all = async (sql, ...a) => (await db.prepare(sql).bind(...a).all()).results;
+    const fmt = (Date.parse(t) - Date.parse(f)) / 864e5 > 62 ? '%Y-%m' : '%Y-%m-%d';
+    const [sales, purch, coll, paid, fin, cogs, invM, invP, recv, pay, cnt, prod, low, recent, sS, pS, eS] = await Promise.all([
+      one("SELECT COALESCE(SUM(total_piastres),0) t,COUNT(*) c FROM sales_invoices WHERE status='issued' AND date(issued_at) BETWEEN ? AND ?", f, t),
+      one("SELECT COALESCE(SUM(total_piastres),0) t,COUNT(*) c FROM purchase_invoices WHERE status='received' AND date(received_at) BETWEEN ? AND ?", f, t),
+      one('SELECT COALESCE(SUM(amount_piastres),0) t FROM customer_payments WHERE date(created_at) BETWEEN ? AND ?', f, t),
+      one('SELECT COALESCE(SUM(amount_piastres),0) t FROM supplier_payments WHERE date(created_at) BETWEEN ? AND ?', f, t),
+      all("SELECT kind,COALESCE(SUM(amount_piastres),0) t FROM finance_entries WHERE status='active' AND entry_date BETWEEN ? AND ? GROUP BY kind", f, t),
+      one("SELECT COALESCE(SUM(ROUND(si.qty*p.cost_piastres)),0) t FROM sales_items si JOIN sales_invoices i ON i.id=si.invoice_id JOIN products p ON p.id=si.product_id WHERE i.status='issued' AND date(i.issued_at) BETWEEN ? AND ?", f, t),
+      one("SELECT COALESCE(SUM(b.q*m.unit_cost_piastres),0) t FROM (SELECT material_id,SUM(qty) q FROM inventory_movements GROUP BY material_id) b JOIN materials m ON m.id=b.material_id WHERE m.status='active'"),
+      one("SELECT COALESCE(SUM(b.q*p.cost_piastres),0) t FROM (SELECT product_id,SUM(qty) q FROM product_movements GROUP BY product_id) b JOIN products p ON p.id=b.product_id WHERE p.status='active'"),
+      one("SELECT COALESCE((SELECT SUM(total_piastres) FROM sales_invoices WHERE status='issued'),0)-COALESCE((SELECT SUM(amount_piastres) FROM customer_payments),0) t"),
+      one("SELECT COALESCE((SELECT SUM(total_piastres) FROM purchase_invoices WHERE status='received'),0)-COALESCE((SELECT SUM(amount_piastres) FROM supplier_payments),0) t"),
+      one("SELECT (SELECT COUNT(*) FROM products WHERE status='active') products,(SELECT COUNT(*) FROM materials WHERE status='active') materials,(SELECT COUNT(*) FROM suppliers WHERE status='active') suppliers,(SELECT COUNT(*) FROM customers WHERE status='active') customers"),
+      one("SELECT (SELECT COUNT(*) FROM production_orders WHERE status IN ('open','in_progress')) running,(SELECT COUNT(*) FROM production_orders WHERE status='completed' AND date(completed_at) BETWEEN ? AND ?) completed,(SELECT COUNT(*) FROM production_orders WHERE status IN ('open','in_progress') AND due_date IS NOT NULL AND due_date<date('now')) late", f, t),
+      all("SELECT m.name,m.unit,m.min_stock,COALESCE(SUM(i.qty),0) q FROM materials m LEFT JOIN inventory_movements i ON i.material_id=m.id WHERE m.status='active' AND m.min_stock>0 GROUP BY m.id HAVING q<=m.min_stock ORDER BY q LIMIT 10"),
+      all('SELECT a.action,a.entity,a.entity_id,a.created_at,u.name user FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 15'),
+      all(`SELECT strftime('${fmt}',issued_at) d,SUM(total_piastres) t FROM sales_invoices WHERE status='issued' AND date(issued_at) BETWEEN ? AND ? GROUP BY d`, f, t),
+      all(`SELECT strftime('${fmt}',received_at) d,SUM(total_piastres) t FROM purchase_invoices WHERE status='received' AND date(received_at) BETWEEN ? AND ? GROUP BY d`, f, t),
+      all(`SELECT strftime('${fmt}',entry_date) d,SUM(amount_piastres) t FROM finance_entries WHERE status='active' AND kind='expense' AND entry_date BETWEEN ? AND ? GROUP BY d`, f, t)]);
+    const exp = fin.find(x => x.kind === 'expense')?.t || 0, rev = fin.find(x => x.kind === 'revenue')?.t || 0;
+    return J({ from: f, to: t, sales, purchases: purch, collected: coll.t, paid: paid.t, expenses: exp, other_revenue: rev, cogs: cogs.t, profit: sales.t + rev - cogs.t - exp,
+      inv_materials: invM.t, inv_products: invP.t, receivable: recv.t, payable: pay.t, counts: cnt, production: prod, low, recent, series: { sales: sS, purchases: pS, expenses: eS } });
+  }
+  if (p === '/api/report' && m === 'GET') {
+    if (!can(user, 'reports.view')) throw new HttpErr(403, 'غير مصرح');
+    const type = url.searchParams.get('type'), [f, t] = period(url), all = async (sql, ...a) => (await env.DB.prepare(sql).bind(...a).all()).results, E = v => v / 100;
+    let cols, rows;
+    if (type === 'sales') {
+      cols = ['التاريخ', 'رقم الفاتورة', 'العميل', 'المخزن', 'الإجمالي', 'مدفوع وقت الفاتورة'];
+      rows = (await all("SELECT i.id,date(i.issued_at) d,c.name c,w.name w,i.total_piastres t,COALESCE((SELECT SUM(amount_piastres) FROM customer_payments WHERE invoice_id=i.id),0) p FROM sales_invoices i JOIN customers c ON c.id=i.customer_id JOIN warehouses w ON w.id=i.warehouse_id WHERE i.status='issued' AND date(i.issued_at) BETWEEN ? AND ? ORDER BY i.id DESC LIMIT 1000", f, t)).map(r => [r.d, 'SI-' + r.id, r.c, r.w, E(r.t), E(r.p)]);
+    } else if (type === 'purchases') {
+      cols = ['التاريخ', 'رقم الفاتورة', 'المورد', 'المخزن', 'الإجمالي', 'مدفوع وقت الفاتورة'];
+      rows = (await all("SELECT i.id,date(i.received_at) d,c.name c,w.name w,i.total_piastres t,COALESCE((SELECT SUM(amount_piastres) FROM supplier_payments WHERE invoice_id=i.id),0) p FROM purchase_invoices i JOIN suppliers c ON c.id=i.supplier_id JOIN warehouses w ON w.id=i.warehouse_id WHERE i.status='received' AND date(i.received_at) BETWEEN ? AND ? ORDER BY i.id DESC LIMIT 1000", f, t)).map(r => [r.d, 'PI-' + r.id, r.c, r.w, E(r.t), E(r.p)]);
+    } else if (type === 'finance') {
+      cols = ['التاريخ', 'النوع', 'التصنيف', 'المبلغ', 'ملاحظة'];
+      rows = (await all("SELECT entry_date,kind,category,amount_piastres,note FROM finance_entries WHERE status='active' AND entry_date BETWEEN ? AND ? ORDER BY entry_date DESC,id DESC LIMIT 1000", f, t)).map(r => [r.entry_date, r.kind === 'expense' ? 'مصروف' : 'إيراد', r.category, E(r.amount_piastres), r.note || '']);
+    } else if (type === 'stock') {
+      cols = ['الخامة', 'الوحدة', 'الرصيد', 'سعر الوحدة', 'القيمة'];
+      rows = (await all("SELECT m.name,m.unit,COALESCE(SUM(i.qty),0) q,m.unit_cost_piastres c FROM materials m LEFT JOIN inventory_movements i ON i.material_id=m.id WHERE m.status='active' GROUP BY m.id ORDER BY m.name")).map(r => [r.name, r.unit, r.q, E(r.c), E(Math.round(r.q * r.c))]);
+    } else if (type === 'pstock') {
+      cols = ['المنتج', 'الرصيد', 'تكلفة الوحدة المسجلة', 'القيمة'];
+      rows = (await all("SELECT p.name,COALESCE(SUM(i.qty),0) q,p.cost_piastres c FROM products p LEFT JOIN product_movements i ON i.product_id=p.id WHERE p.status='active' GROUP BY p.id ORDER BY p.name")).map(r => [r.name, r.q, E(r.c), E(Math.round(r.q * r.c))]);
+    } else if (type === 'production') {
+      cols = ['التاريخ', 'رقم الأمر', 'المنتج', 'الحالة', 'المخطط', 'الجيد', 'التالف', 'إجمالي التكلفة'];
+      rows = (await all("SELECT o.id,date(o.created_at) d,p.name,o.status,o.qty_planned,o.qty_good,o.qty_scrap,o.total_cost_piastres t FROM production_orders o JOIN products p ON p.id=o.product_id WHERE date(o.created_at) BETWEEN ? AND ? ORDER BY o.id DESC LIMIT 1000", f, t)).map(r => [r.d, 'MO-' + r.id, r.name, ORD[r.status], r.qty_planned, r.qty_good, r.qty_scrap, E(r.t)]);
+    } else throw new HttpErr(400, 'نوع التقرير غير معروف');
+    return J({ cols, rows });
   }
   throw new HttpErr(404, 'غير موجود');
 }
